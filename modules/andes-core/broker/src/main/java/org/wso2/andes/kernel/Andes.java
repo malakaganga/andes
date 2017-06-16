@@ -386,6 +386,31 @@ public class Andes {
     }
 
     /**
+     * Delete a selected message list from a given Dead Letter Queue of a tenant.
+     *
+     * @param andesMetadataIDs     The browser message Ids
+     * @param destinationQueueName The Dead Letter Queue Name for the tenant
+     */
+    public void deleteMessagesFromDeadLetterQueue(long[] andesMetadataIDs, String destinationQueueName) {
+
+        List<AndesMessageMetadata> messageMetadataList = new ArrayList<>(andesMetadataIDs.length);
+
+        for (long andesMetadataID : andesMetadataIDs) {
+            AndesMessageMetadata messageToRemove = new AndesMessageMetadata(andesMetadataID, null, false);
+            messageToRemove.setStorageQueueName(destinationQueueName);
+            messageToRemove.setDestination(destinationQueueName);
+            messageMetadataList.add(messageToRemove);
+        }
+
+        // Deleting messages which are in the list.
+        try {
+            deleteMessagesFromDLC(messageMetadataList);
+        } catch (AndesException e) {
+            throw new RuntimeException("Error deleting messages from Dead Letter Channel", e);
+        }
+    }
+
+    /**
      * Create queue in Andes kernel.
      *
      * @param queueEvent queue event to create
