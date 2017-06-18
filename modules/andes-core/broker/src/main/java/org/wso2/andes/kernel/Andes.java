@@ -130,6 +130,17 @@ public class Andes {
     private final int maxParallelDtxConnections;
 
     /**
+     * AndesChannel for this dead letter channel restore which implements flow control.
+     */
+    AndesChannel andesChannel;
+
+    /**
+     * The message restore flowcontrol blocking state.
+     * If true message restore will be interrupted from dead letter channel.
+     */
+    boolean restoreBlockedByFlowControl = false;
+
+    /**
      * Instance of AndesAPI returned.
      *
      * @return AndesAPI
@@ -137,6 +148,12 @@ public class Andes {
     public static Andes getInstance() {
         return instance;
     }
+
+    /**
+     * Publisher Acknowledgements are disabled
+     * hence using DisablePubAckImpl to drop any pub ack request by Andes
+     */
+    private  DisablePubAckImpl disablePubAck = null;
 
     /**
      * Singleton class. Hence private constructor.
@@ -151,7 +168,6 @@ public class Andes {
 
         dtxChannelList = new ArrayList<>();
     }
-
 
     /**
      * Recover messages for the subscriber. Re-schedule sent but un-ackenowledged
@@ -194,7 +210,7 @@ public class Andes {
      * @param andesChannel  AndesChannel
      * @param pubAckHandler PubAckHandler
      */
-    public void messageReceived(AndesMessage message, AndesChannel andesChannel, PubAckHandler pubAckHandler) {
+    public void  messageReceived(AndesMessage message, AndesChannel andesChannel, PubAckHandler pubAckHandler) {
 
         //Tracing message
         MessageTracer.trace(message, MessageTracer.REACHED_ANDES_CORE);
@@ -611,6 +627,17 @@ public class Andes {
     }
 
     /**
+     * Get message IDs in dlc for a queue for a given number of messages starting from the specified id.
+     *
+     * @param sourceQueue    name of the queue
+     * @param dlcQueueName   name of the dead letter channel queue
+     * @param startMessageId starting message id
+     * @param messageLimit   maximum num of messages to return in one invocation.
+     * @return List<Long> of message IDs
+     * @throws AndesException if an error occurs while reading message IDs from database.
+     */
+
+    /**
      * Get expired but not yet deleted messages from message store.
      *
      * @param lowerBoundMessageID lower bound message Id of the safe zone for delete
@@ -814,6 +841,135 @@ public class Andes {
     public List<Long> getNextNMessageIdsInDLC(final String dlcQueueName, long startMessageId, int messageLimit)
             throws AndesException {
         return MessagingEngine.getInstance().getNextNMessageIdsInDLC(dlcQueueName, startMessageId, messageLimit);
+    }
+
+    /***
+     * Get message IDs in DLC starting from given startMessageId up to the given message count.
+     *
+     * @param dlcQueueName Queue name of the Dead Letter Channel
+     * @param startMessageId last message ID returned from invoking this method.
+     * @return List<Long> of message IDs moved to the DLC from the sourceQueue.
+     * @throws AndesException if an error occurs while reading messages from the database.
+     */
+    public int rerouteAllMessagesInDeadLetterChannelForQueue(String dlcQueueName, String sourceQueue, String
+            targetQueue, int internalBatchSize, boolean restoreToOriginalQueue) throws AndesException {
+
+        List<Long> currentMessageIdList;
+        Long lastMessageId = 0L;
+        int movedMessageCount = 0;
+        currentMessageIdList = getNextNMessageIdsInDLCForQueue(sourceQueue, dlcQueueName, lastMessageId,
+                internalBatchSize);
+        while (currentMessageIdList.size() > 0) {
+            int movedMessageCountInThisBatch = moveMessagesFromDLCToNewDestination(currentMessageIdList, sourceQueue,
+                    targetQueue, restoreToOriginalQueue);
+
+            if (log.isDebugEnabled()) {
+                log.debug("Successfully restored messages from sourceQueue : " + sourceQueue + " to targetQueue : " +
+                        targetQueue + " movedMessageCountInThisBatch : " + movedMessageCountInThisBatch);
+            }
+
+            movedMessageCount = movedMessageCount + movedMessageCountInThisBatch;
+            lastMessageId = currentMessageIdList.get(currentMessageIdList.size() - 1);
+
+            currentMessageIdList = getNextNMessageIdsInDLCForQueue(sourceQueue, dlcQueueName, lastMessageId,
+                    internalBatchSize);
+        }
+        return movedMessageCount;
+
+    }
+
+    /**
+     * Common method to restore a list of messages based on Id to its original queue or a different queue.
+     *
+     * @param messageIds             list of messages to be restored
+     * @param sourceQueue            original destination queue of the messages.
+     * @param targetQueue            new target destination of the messages.
+     * @param restoreToOriginalQueue true if the messages need to be restored to their original
+     *                               queues instead of a single target queue.
+     * @return int Number of messages that were successfully restored.
+     * @throws AndesException if the database calls to read/delete the messages/content fails.
+     */
+    private int moveMessagesFromDLCToNewDestination(List<Long> messageIds, String sourceQueue, String targetQueue,
+                                                    boolean restoreToOriginalQueue)
+            throws AndesException {
+
+        andesChannel = createChannel(new FlowControlListener() {
+            @Override
+            public void block() {
+                restoreBlockedByFlowControl = true;
+            }
+
+            @Override
+            public void unblock() {
+                restoreBlockedByFlowControl = false;
+            }
+
+            @Override
+            public void disconnect() {
+                // Do nothing. since its not applicable.
+            }
+        });
+
+        disablePubAck = new DisablePubAckImpl();
+
+        List<AndesMessageMetadata> messagesToRemove = new ArrayList<>(messageIds.size());
+
+        LongArrayList messageIdCollection = new LongArrayList();
+        for (Long messageId : messageIds) {
+            messageIdCollection.add(messageId);
+        }
+
+        int movedMessageCount = 0;
+        LongObjectHashMap<List<AndesMessagePart>> messageContent = getContent(messageIdCollection);
+        boolean interruptedByFlowControl = false;
+
+        for (Long messageId : messageIds) {
+            if (restoreBlockedByFlowControl) {
+                interruptedByFlowControl = true;
+                break;
+            }
+            AndesMessageMetadata metadata = getMessageMetaData(messageId);
+            if (!restoreToOriginalQueue) {
+                StorageQueue newStorageQueue = AndesContext.getInstance().getStorageQueueRegistry()
+                        .getStorageQueue(targetQueue);
+
+                // Set the new destination queue
+                metadata.setDestination(targetQueue);
+                metadata.setStorageQueueName(targetQueue);
+                metadata.setMessageRouterName(newStorageQueue.getMessageRouter().getName());
+                metadata.updateMetadata(targetQueue, newStorageQueue.getMessageRouter().getName());
+            }
+
+            AndesMessageMetadata clonedMetadata = metadata.shallowCopy(metadata.getMessageID());
+            AndesMessage andesMessage = new AndesMessage(clonedMetadata);
+
+            messagesToRemove.add(metadata);
+            // Update Andes message with all the chunk details
+            if(!messageContent.isEmpty()) {
+                List<AndesMessagePart> messageParts = messageContent.get(messageId);
+                for (AndesMessagePart messagePart : messageParts) {
+                    andesMessage.addMessagePart(messagePart);
+                }
+            }
+
+            // Handover message to Andes. This will generate a new message ID and store it
+            messageReceived(andesMessage, andesChannel, disablePubAck);
+
+            movedMessageCount++;
+        }
+
+        if (interruptedByFlowControl) {
+            // Throw this out so UI will show this to the user as an error message.
+            // Messages can be duplicated
+            throw new AndesException("Message restore from dead letter queue has been interrupted by flow "
+                    + "control. Messages in the DLC for sourceQueue : " + sourceQueue + " may be duplicated due to "
+                    + "this situation. Please try again later. movedMessageCount : " + movedMessageCount);
+        }
+
+        // Delete old messages
+        deleteMessagesFromDLC(messagesToRemove);
+
+        return movedMessageCount;
     }
 
     /**
