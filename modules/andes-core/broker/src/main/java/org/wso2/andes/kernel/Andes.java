@@ -889,7 +889,7 @@ public class Andes {
      * @return int Number of messages that were successfully restored.
      * @throws AndesException if the database calls to read/delete the messages/content fails.
      */
-    private int moveMessagesFromDLCToNewDestination(List<Long> messageIds, String sourceQueue, String targetQueue,
+    public int moveMessagesFromDLCToNewDestination(List<Long> messageIds, String sourceQueue, String targetQueue,
                                                     boolean restoreToOriginalQueue)
             throws AndesException {
 
