@@ -973,6 +973,44 @@ public class Andes {
     }
 
     /**
+     * Get message metadata in dlc for a queue for a given number of messages starting from a specified id.
+     *
+     * @param queueName    name of the queue
+     * @param dlcQueueName name of the dead letter channel queue
+     * @param firstMsgId   starting message id
+     * @param count        maximum num of messages to return
+     * @return List of message metadata
+     * @throws AndesException
+     */
+    public List<AndesMessage> getNextNMessageContentInDLCForQueue(final String queueName,
+                                                                          final String dlcQueueName, long firstMsgId, int count) throws AndesException {
+        List<Long> currentMessageIdList;
+        List<AndesMessage> andesMessageList = new ArrayList<>();
+        currentMessageIdList = getNextNMessageIdsInDLCForQueue(queueName, dlcQueueName, firstMsgId, count);
+        LongArrayList messageIdCollection = new LongArrayList();
+
+        for (Long messageId : currentMessageIdList) {
+            messageIdCollection.add(messageId);
+        }
+
+        LongObjectHashMap<List<AndesMessagePart>> messageContent = getContent(messageIdCollection);
+
+        for (Long messageId : currentMessageIdList) {
+            AndesMessageMetadata metadata = getMessageMetaData(messageId);
+            AndesMessage andesMessage = new AndesMessage(metadata);
+            if(!messageContent.isEmpty()) {
+                List<AndesMessagePart> messageParts = messageContent.get(messageId);
+                for (AndesMessagePart messagePart : messageParts) {
+                    andesMessage.addMessagePart(messagePart);
+                }
+            }
+            andesMessageList.add(andesMessage);
+        }
+
+        return andesMessageList;
+    }
+
+    /**
      * Publishes a channel suspend/resume event to the disruptor.
      *
      * @param channelId           the channel id from which the request was received
